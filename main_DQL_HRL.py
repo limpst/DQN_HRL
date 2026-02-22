@@ -8,10 +8,11 @@ from collections import deque
 import random
 from datetime import datetime
 import os
+import sys
 
 
 # ==========================================
-# 1. DQN 신경망 및 에이전트 (기존 구조 유지)
+# 1. DQN 신경망 및 에이전트
 # ==========================================
 class QNetwork(nn.Module):
     def __init__(self, state_dim, action_dim):
@@ -38,7 +39,6 @@ class DQNAgent:
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005)
         self.update_target()
 
-        # Action Map: (S_i, T_w, Limit)
         self.action_map = {
             0: (0.25, 60, 100000), 1: (0.25, 240, 150000), 2: (0.25, 600, 250000),
             3: (0.15, 60, 150000), 4: (0.15, 240, 200000), 5: (0.15, 600, 300000),
@@ -50,7 +50,7 @@ class DQNAgent:
 
     def select_action(self, state):
         if np.random.rand() <= self.epsilon: return random.randrange(self.action_dim)
-        st = torch.FloatTensor(state).to(self.device);
+        st = torch.FloatTensor(state).to(self.device)
         return torch.argmax(self.model(st)).item()
 
     def train(self, batch_size=64):
@@ -58,20 +58,20 @@ class DQNAgent:
         batch = random.sample(self.memory, batch_size)
         s, a, r, ns, d = zip(*batch)
         s, a, r, ns, d = torch.FloatTensor(np.array(s)).to(self.device), torch.LongTensor(a).to(self.device), \
-            torch.FloatTensor(r).to(self.device), torch.FloatTensor(np.array(ns)).to(self.device), torch.FloatTensor(
-            d).to(self.device)
-        curr_q = self.model(s).gather(1, a.unsqueeze(1));
+            torch.FloatTensor(r).to(self.device), torch.FloatTensor(np.array(ns)).to(self.device), \
+            torch.FloatTensor(d).to(self.device)
+        curr_q = self.model(s).gather(1, a.unsqueeze(1))
         next_q = self.target_model(ns).max(1)[0].detach()
         target_q = r + (1 - d) * self.gamma * next_q
         loss = nn.MSELoss()(curr_q.squeeze(), target_q)
-        self.optimizer.zero_grad();
-        loss.backward();
+        self.optimizer.zero_grad()
+        loss.backward()
         self.optimizer.step()
         if self.epsilon > self.epsilon_min: self.epsilon *= self.epsilon_decay
 
 
 # ==========================================
-# 2. 데이터 전처리 유틸리티
+# 2. 데이터 로드 및 전처리
 # ==========================================
 def get_state(vol, dur, inv, limit):
     return np.array([vol * 1000, dur / 600, inv / limit], dtype=np.float32)
@@ -82,16 +82,15 @@ def clean_columns(df):
     return df
 
 
-# 데이터 로드
 rates_path = 'v:/PythonProject1/sideProject1/data/환율(KST).xlsx'
 trades_path = 'v:/PythonProject1/sideProject1/data/거래데이터(KST).csv'
+
 df_rates = clean_columns(pd.read_excel(rates_path)).sort_values('시간(KST)')
 df_trades = clean_columns(pd.read_csv(trades_path)).sort_values('체결시간')
 df_rates['시간(KST)'] = pd.to_datetime(df_rates['시간(KST)'])
 df_trades['체결시간'] = pd.to_datetime(df_trades['체결시간'])
 df_trades = df_trades[df_trades['통화'] == 'USD'].copy()
 
-# 지표 계산 (HARCH + ACD)
 returns = df_rates['USD'].pct_change()
 df_rates['vol'] = returns.rolling(120).std().bfill().fillna(0.0001)
 durations = df_trades['체결시간'].diff().dt.total_seconds().fillna(60).clip(lower=1)
@@ -106,15 +105,17 @@ trade_times = df_trades['체결시간'].sort_values().unique()
 trade_groups = {t: rows for t, rows in df_trades.groupby('체결시간')}
 
 # ==========================================
-# 3. 시뮬레이션 메인 루프 (DQN 학습 + 상세 기록)
+# 3. 시뮬레이션 메인 루프 (로그 강화 버전)
 # ==========================================
 agent = DQNAgent(state_dim=3, action_dim=9)
 results, pending_lots = [], []
-inventory, netting_profit, recent_pnl = 0.0, 0.0, 0.0
+inventory, netting_profit, current_trade_pnl = 0.0, 0.0, 0.0
 manager_interval = 100
 current_action_idx = 4
+total_steps = len(trade_times)
 
-print(f"🚀 DQN-HRL 시뮬레이션 시작...")
+print(f"🚀 DQN-HRL 시뮬레이션 시작 (Total: {total_steps} events)")
+print("-" * 100)
 
 for i, t in enumerate(trade_times):
     current_time = pd.Timestamp(t)
@@ -128,17 +129,25 @@ for i, t in enumerate(trade_times):
     state = get_state(c_vol, c_dur, inventory, BASE_LIMIT)
 
     if i % manager_interval == 0 and i > 0:
-        reward = recent_pnl - (abs(inventory) * 0.00005)  # 재고 비용 페널티
+        # 보상 함수: $R = \Delta PnL - (Inventory \times Cost)$
+        reward = (current_trade_pnl + netting_profit) - (abs(inventory) * 0.00005)
         agent.memory.append((prev_state, current_action_idx, reward, state, False))
         agent.train()
         if i % 1000 == 0: agent.update_target()
         current_action_idx = agent.select_action(state)
         prev_state = state
-        recent_pnl = 0.0
+
     elif i == 0:
         prev_state = state
 
-    # --- [Worker] Trading ---
+    # --- 실시간 로그 출력 ---
+    if i % 500 == 0 or i == total_steps - 1:
+        total_realized = current_trade_pnl + netting_profit
+        progress = (i / total_steps) * 100
+        print(f"[{progress:5.1f}%] {current_time} | Action: {current_action_idx} | "
+              f"Inv: {inventory:10,.0f} | Realized PnL: {total_realized:12,.0f}원")
+
+    # --- [Worker] Trading Logic ---
     bank_s, is_closed = (0.3, False) if 9 <= current_time.hour < 16 else (0.6, False)
     if 2 <= current_time.hour < 9: is_closed = True
 
@@ -147,27 +156,21 @@ for i, t in enumerate(trade_times):
         mm_side = '매도' if row['주문유형'] == '매수' else '매수'
         cu_qty = -qty if mm_side == '매도' else qty
 
-        # 넷팅 수익
-        net_gain = 0.0
+        # 넷팅 수익 발생 여부 체크
         if inventory != 0 and (inventory * cu_qty) < 0:
             matched = min(abs(inventory), abs(cu_qty))
-            net_gain = matched * (0.0 if is_closed else bank_s) * 2
-            netting_profit += net_gain
-            recent_pnl += net_gain
+            netting_profit += matched * (0.0 if is_closed else bank_s) * 2
 
         inventory += cu_qty
         lot = row.to_dict()
         lot.update({
-            'MM_Side': mm_side, 'Entry_Rate': float(row.get('가격', row.get('체결단가'))), 'Entry_Time': current_time,
-            'DQN_State_Vol': c_vol, 'DQN_State_Dur': c_dur, 'DQN_State_Inv': inventory,
-            'S_i': S_i, 'T_w': T_w_base, 'Limit': BASE_LIMIT, 'Action_Idx': current_action_idx,
-            'Netting_Gain_Event': net_gain
+            'MM_Side': mm_side, 'Entry_Rate': float(row.get('체결단가', row.get('가격'))),
+            'Entry_Time': current_time, 'S_i': S_i, 'T_w': T_w_base, 'Limit': BASE_LIMIT
         })
         pending_lots.append(lot)
 
     if is_closed or not pending_lots: continue
 
-    # Liquidation (Tier 1-3)
     active = []
     for o in pending_lots:
         expected = (o['Entry_Rate'] - (c_rate + bank_s)) if o['MM_Side'] == '매도' else (
@@ -184,40 +187,48 @@ for i, t in enumerate(trade_times):
 
         if method:
             pnl = expected * float(o['수량'])
+            current_trade_pnl += pnl
             o.update({
-                'Exit_Time': current_time, 'Exit_Rate': (c_rate + bank_s if o['MM_Side'] == '매도' else c_rate - bank_s),
+                'Exit_Time': current_time,
+                'Exit_Rate': (c_rate + bank_s if o['MM_Side'] == '매도' else c_rate - bank_s),
                 'PnL': pnl, 'Exit_Method': method
             })
             results.append(o)
-            recent_pnl += pnl
             inventory += (float(o['수량']) if o['MM_Side'] == '매도' else -float(o['수량']))
         else:
             active.append(o)
     pending_lots = active
 
 # ==========================================
-# 4. 결과 저장 및 시각화
+# 4. 결과 요약 및 시각화
 # ==========================================
 df_res = pd.DataFrame(results)
-trade_pnl = df_res['PnL'].sum() if not df_res.empty else 0.0
-final_total = trade_pnl + netting_profit
-
+final_total = current_trade_pnl + netting_profit
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-out_trades = f"dqn_hrl_trades_{timestamp}.csv"
-df_res.to_csv(out_trades, index=False, encoding='utf-8-sig')
 
-print(f"\n" + "=" * 50)
-print(f"✅ 최종 실현 손익: {final_total:,.0f} 원")
-print(f"💰 넷팅 수익 합: {netting_profit:,.0f} 원")
-print(f"📊 Tier1 성공률: {(df_res['Exit_Method'] == 'Tier1_TP').mean() * 100:.1f}%")
-print(f"📝 상세 로그 저장 완료: {out_trades}")
-print("=" * 50)
 
-# 시각화
-df_res['CumPnL'] = df_res['PnL'].cumsum() + netting_profit * (df_res.index / len(df_res))
-plt.figure(figsize=(12, 5))
-plt.plot(df_res['Exit_Time'], df_res['CumPnL'], label='DQN-HRL MM')
-plt.title(f"DQN-HRL Market Making Cumulative PnL\n(Final: {final_total:,.0f} KRW)")
-plt.grid(True, alpha=0.3);
-plt.legend();
-plt.show()
+out_trades = f"dqn_hrl_simulation_trades_{timestamp}.csv"
+
+if not df_res.empty:
+    df_res.to_csv(out_trades, index=False, encoding='utf-8-sig')
+
+print(f"\n✅ 파일 저장 완료: {out_trades}")
+
+print("\n" + "=" * 60)
+print(f"✅ 시뮬레이션 종료 | 최종 실현 손익: {final_total:,.0f} 원")
+print(f"💰 넷팅(스프레드) 수익: {netting_profit:,.0f} 원 | 거래 손익: {current_trade_pnl:,.0f} 원")
+if not df_res.empty:
+    print(f"📊 Tier1(익절) 성공률: {(df_res['Exit_Method'] == 'Tier1_TP').mean() * 100:.1f}%")
+print("=" * 60)
+
+# Cumulative PnL Graph
+if not df_res.empty:
+    df_res['CumPnL'] = df_res['PnL'].cumsum() + (netting_profit / len(df_res)) * np.arange(len(df_res))
+    plt.figure(figsize=(12, 5))
+    plt.plot(df_res['Exit_Time'], df_res['CumPnL'], label='DQN-HRL MM Performance', color='#1f77b4')
+    plt.fill_between(df_res['Exit_Time'], df_res['CumPnL'], alpha=0.1, color='#1f77b4')
+    plt.title(f"DQN-HRL Market Making Cumulative PnL\nFinal: {final_total:,.0f} KRW", fontsize=12)
+    plt.grid(True, alpha=0.3);
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
